@@ -3,6 +3,7 @@ Single-file 2D CNN training for EEG seizure detection using spectrograms.
 Uses the existing CHBMITDataset from data_loader.py
 """
 
+import os
 import argparse
 import numpy as np
 import torch
@@ -12,9 +13,8 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from scipy import signal
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
 from pathlib import Path
-import sys
 
-# Import existing data loader
+# Import data loader
 from data_loader import CHBMITDataset
 
 
@@ -24,7 +24,7 @@ def make_spectrogram(window, nperseg=64, noverlap=32, target_fs=256):
     
     Args:
         window: Array of shape (23, 1024) - 23 channels, 1024 samples
-        nperseg: Length of each segment for STFT
+        nperseg: Length of each segment for STFT~
         noverlap: Number of points to overlap between segments
         target_fs: Sampling frequency (256 Hz)
         
@@ -32,7 +32,6 @@ def make_spectrogram(window, nperseg=64, noverlap=32, target_fs=256):
         spectrogram: Array of shape (1, freq_bins, time_bins)
     """
     # Average across channels to get single signal
-    # Alternative: could use max, sum, or other aggregation
     averaged_signal = np.mean(window, axis=0)
     
     # Compute spectrogram using scipy
@@ -44,16 +43,14 @@ def make_spectrogram(window, nperseg=64, noverlap=32, target_fs=256):
         mode='magnitude',
     )
     
-    # Log-scale normalization (common for EEG spectrograms)
-    Sxx = np.log1p(Sxx)  # log(1 + Sxx) to avoid log(0)
+    # Log-scale normalization
+    Sxx = np.log1p(Sxx) 
     
-    # Min-max normalize to [0, 1]
     Sxx_min = Sxx.min()
     Sxx_max = Sxx.max()
     if Sxx_max > Sxx_min:
         Sxx = (Sxx - Sxx_min) / (Sxx_max - Sxx_min)
     
-    # Add channel dimension: (freq_bins, time_bins) -> (1, freq_bins, time_bins)
     Sxx = Sxx[np.newaxis, :, :]
     
     return Sxx.astype(np.float32)
@@ -74,6 +71,7 @@ class SpectrogramDataset(Dataset):
         self.base_dataset = base_dataset
         self.nperseg = nperseg
         self.noverlap = noverlap
+        self.target_fs = base_dataset.target_fs
         
     def __len__(self):
         return len(self.base_dataset)
@@ -91,13 +89,10 @@ class SpectrogramDataset(Dataset):
             window,
             nperseg=self.nperseg,
             noverlap=self.noverlap,
+            target_fs=self.target_fs,
         )
         
-        # Convert to tensor
-        spectrogram = torch.FloatTensor(spectrogram)
-        label = torch.LongTensor([label])[0]
-        
-        return spectrogram, label
+        return torch.FloatTensor(spectrogram), torch.tensor(int(label), dtype=torch.long)
 
 
 class CNN2D(nn.Module):
@@ -106,71 +101,35 @@ class CNN2D(nn.Module):
     """
     
     def __init__(self, num_classes=2):
-        super(CNN2D, self).__init__()
-        
-        # First convolutional block
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, padding=1)
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        # Second convolutional block
-        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
+        self.pool1 = nn.MaxPool2d(2, 2)
+
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        # Third convolutional block (optional, for deeper network)
-        self.conv3 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
+        self.pool2 = nn.MaxPool2d(2, 2)
+
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm2d(128)
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        # Dropout
+        self.pool3 = nn.MaxPool2d(2, 2)
+
         self.dropout = nn.Dropout(0.5)
-        
-        # We'll compute flattened size dynamically after first forward pass
-        self.flatten_size = None
-        self.fc = None
-        
+
+        self.gap = nn.AdaptiveAvgPool2d((1, 1)) 
+        self.fc = nn.Linear(128, num_classes)
+
     def forward(self, x):
-        """
-        Forward pass.
-        
-        Args:
-            x: Input tensor of shape (batch, 1, freq_bins, time_bins)
-            
-        Returns:
-            logits: Output logits of shape (batch, num_classes)
-        """
-        # First conv block
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = torch.relu(x)
-        x = self.pool1(x)
-        
-        # Second conv block
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = torch.relu(x)
-        x = self.pool2(x)
-        
-        # Third conv block
-        x = self.conv3(x)
-        x = self.bn3(x)
-        x = torch.relu(x)
-        x = self.pool3(x)
-        
-        # Flatten
-        x = x.view(x.size(0), -1)
-        
-        # Initialize fully connected layer on first forward pass
-        if self.flatten_size is None:
-            self.flatten_size = x.size(1)
-            self.fc = nn.Linear(self.flatten_size, 2).to(x.device)
-        
-        # Fully connected layer
+        x = self.pool1(torch.relu(self.bn1(self.conv1(x))))
+        x = self.pool2(torch.relu(self.bn2(self.conv2(x))))
+        x = self.pool3(torch.relu(self.bn3(self.conv3(x))))
+
+        x = self.gap(x)
+        x = x.view(x.size(0), -1)  
+
         x = self.dropout(x)
-        x = self.fc(x)
-        
-        return x
+        return self.fc(x)
 
 
 def compute_metrics(y_true, y_pred, y_scores=None):
@@ -195,7 +154,10 @@ def compute_metrics(y_true, y_pred, y_scores=None):
     
     # Confusion matrix
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
+    if cm.size == 4:
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn = fp = fn = tp = 0
     
     # Sensitivity (Recall, True Positive Rate)
     metrics['sensitivity'] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -207,14 +169,12 @@ def compute_metrics(y_true, y_pred, y_scores=None):
     if y_scores is not None:
         try:
             # If y_scores is 2D (probabilities), take positive class
-            if len(y_scores.shape) > 1 and y_scores.shape[1] > 1:
-                y_scores = y_scores[:, 1]
-            metrics['auc'] = roc_auc_score(y_true, y_scores)
+            metrics["auc"] = roc_auc_score(y_true, y_scores)
         except ValueError:
-            metrics['auc'] = np.nan
+            metrics["auc"] = np.nan
     else:
-        metrics['auc'] = np.nan
-    
+        metrics["auc"] = np.nan
+
     return metrics
 
 
@@ -222,31 +182,26 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     """Train for one epoch."""
     model.train()
     running_loss = 0.0
-    all_preds = []
-    all_labels = []
-    
-    for spectrograms, labels in dataloader:
-        spectrograms = spectrograms.to(device)
-        labels = labels.to(device)
-        
-        # Forward pass
+    all_preds, all_labels = [], []
+
+    for x, y in dataloader:
+        x = x.to(device)
+        y = y.to(device)
+
         optimizer.zero_grad()
-        outputs = model(spectrograms)
-        loss = criterion(outputs, labels)
-        
-        # Backward pass
+        logits = model(x)
+        loss = criterion(logits, y)
         loss.backward()
         optimizer.step()
-        
-        # Statistics
+
         running_loss += loss.item()
-        _, preds = torch.max(outputs, 1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-    
-    epoch_loss = running_loss / len(dataloader)
+        preds = torch.argmax(logits, dim=1)
+
+        all_preds.extend(preds.detach().cpu().numpy())
+        all_labels.extend(y.detach().cpu().numpy())
+
+    epoch_loss = running_loss / max(len(dataloader), 1)
     metrics = compute_metrics(np.array(all_labels), np.array(all_preds))
-    
     return epoch_loss, metrics
 
 
@@ -259,24 +214,22 @@ def validate_epoch(model, dataloader, criterion, device):
     all_scores = []
     
     with torch.no_grad():
-        for spectrograms, labels in dataloader:
-            spectrograms = spectrograms.to(device)
-            labels = labels.to(device)
+        for x, y in dataloader:
+            x = x.to(device)
+            y = y.to(device)
             
-            # Forward pass
-            outputs = model(spectrograms)
-            loss = criterion(outputs, labels)
-            
-            # Statistics
+            logits = model(x)
+            loss = criterion(logits, y)
             running_loss += loss.item()
-            _, preds = torch.max(outputs, 1)
-            probs = torch.softmax(outputs, dim=1)
+
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(logits, dim=1)
             
             all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
             all_scores.extend(probs[:, 1].cpu().numpy())
     
-    epoch_loss = running_loss / len(dataloader)
+    epoch_loss = running_loss / max(len(dataloader), 1)
     metrics = compute_metrics(
         np.array(all_labels),
         np.array(all_preds),
@@ -303,7 +256,7 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=50,
+        default=30,
         help="Number of epochs (default: 50)",
     )
     parser.add_argument(
@@ -336,6 +289,24 @@ def main():
         default=42,
         help="Random seed (default: 42)",
     )
+
+    parser.add_argument(
+        "--max-patients", 
+        type=int, 
+        default=None)
+    parser.add_argument(
+        "--max-files-per-patient", 
+        type=int, 
+        default=None)
+    parser.add_argument(
+        "--max-windows", 
+        type=int, 
+        default=None)
+    
+    parser.add_argument(
+        "--use-class-weights", 
+        action="store_true",
+        help="Use class-weighted loss for seizure imbalance")
     
     args = parser.parse_args()
     
@@ -351,13 +322,9 @@ def main():
     
     # Check data directory exists
     data_path = Path(args.data)
-    if not data_path.exists():
+    if not data_path.exists() or not data_path.is_dir():
         print(f"\nERROR: Data directory does not exist: {data_path}")
         print(f"Please check the path and try again.")
-        return
-    
-    if not data_path.is_dir():
-        print(f"\nERROR: Path is not a directory: {data_path}")
         return
     
     # Debug: Check what's in the data directory
@@ -389,7 +356,7 @@ def main():
     
     # Check for EDF files
     edf_count = 0
-    for patient_dir in patient_dirs[:5]:  # Check first 5 patients
+    for patient_dir in patient_dirs[:3]:  # Check first 3 patients
         edf_files = list(patient_dir.glob("*.edf"))
         edf_count += len(edf_files)
         if len(edf_files) > 0:
@@ -401,8 +368,13 @@ def main():
     
     # Load base dataset
     print("\nLoading CHB-MIT dataset...")
-    base_dataset = CHBMITDataset(args.data)
-    
+    base_dataset = CHBMITDataset(
+        args.data,
+        max_patients=args.max_patients,
+        max_files_per_patient=args.max_files_per_patient,
+        max_windows=args.max_windows,
+    )
+
     if len(base_dataset) == 0:
         print("\nERROR: Dataset loaded 0 windows!")
         print("This usually means:")
@@ -452,23 +424,24 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True if torch.cuda.is_available() else False,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True if torch.cuda.is_available() else False,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True if torch.cuda.is_available() else False,
     )
+    
     
     # Create model
     print("\nCreating 2D CNN model...")
@@ -536,9 +509,13 @@ def main():
         print()
     
     # Load best model
-    print(f"\nLoaded best model from epoch {best_epoch}")
-    checkpoint = torch.load(args.save_model)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if best_epoch > 0 and os.path.exists(args.save_model):
+        print(f"\nLoaded best model from epoch {best_epoch}")
+        checkpoint = torch.load(args.save_model, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        print("\nNo best model checkpoint was saved (AUC was NaN every epoch).")
+        print("Using the final epoch model weights for test evaluation.")
     
     # Evaluate on test set
     print("\n" + "=" * 60)

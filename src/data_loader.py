@@ -9,13 +9,16 @@ from pathlib import Path
 
 class CHBMITDataset(Dataset):
     
-    def __init__(self, data_dir, window_size=4, overlap=0.5, target_fs=256):
+    def __init__(self, data_dir, window_size=4, overlap=0.5, target_fs=256, max_patients=None, max_files_per_patient=None, max_windows=None):
         """
         Args
             data_dir: Path to data directory
             window_size: Window length in seconds
             overlap: Overlap fraction ( 0 to 1)
             target_fs: Target sampling frequency
+            max_patients: Optional cap on number of patient folders to load
+            max_files_per_patient: Optional cap on EDF files per patient
+            max_windows: Optional hard cap on total windows across all patients
         """
         self.data_dir = Path(data_dir)
         self.window_size = window_size #section of conintuous eeg file (4 seconds)
@@ -23,6 +26,10 @@ class CHBMITDataset(Dataset):
         self.target_fs = target_fs #256 Hz (256 times per second)
         self.samples_per_window = int(window_size * target_fs) # 4 * 256 
         self.stride = int(self.samples_per_window * (1 - overlap))
+        
+        self.max_patients = max_patients
+        self.max_files_per_patient = max_files_per_patient
+        self.max_windows = max_windows
         
         # Load data and create index
         self.windows, self.labels = self._load_all_data()
@@ -45,7 +52,7 @@ class CHBMITDataset(Dataset):
         
         #get data
         data = raw.get_data() # 23 x num samples (921600 for 1 hour)
-        n_channels, n_samples = data.shape
+        _, n_samples = data.shape
         
         windows = []
         labels = []
@@ -56,7 +63,13 @@ class CHBMITDataset(Dataset):
             window = data[:, start:end]
             
             # Normalize window
-            window = (window - window.mean(axis=1, keepdims=True)) / (window.std(axis=1, keepdims=True) + 1e-8)
+            window = window.astype(np.float32, copy=False)
+
+            mean = window.mean(axis=1, keepdims=True, dtype=np.float32)
+            window -= mean
+
+            std = window.std(axis=1, keepdims=True, dtype=np.float32)
+            window /= (std + 1e-6)
             
             # Label window
             window_time = start / self.target_fs
@@ -79,28 +92,61 @@ class CHBMITDataset(Dataset):
         labels = []
         
         # all folders in data directory (whatever is downloaded in drive)
-        patient_dirs = sorted([d for d in self.data_dir.iterdir() if d.is_dir()])
-        
+        patient_dirs = sorted([d for d in self.data_dir.iterdir() if d.is_dir()])       
+        patient_dirs = patient_dirs[:self.max_patients] if self.max_patients is not None else patient_dirs
+
         for patient_dir in patient_dirs:
             print(f"Loading {patient_dir.name}...")
-            
+
             # Parse seizure annotations from summary file
             seizure_info = self._parse_summary(patient_dir)
-            
+
             # Load each EDF (European data format) file
-            # each edf has continuoes EEG recordings (1 hour)
             edf_files = sorted(patient_dir.glob("*.edf"))
+            edf_files = edf_files[:self.max_files_per_patient] if self.max_files_per_patient is not None else edf_files
+
             for edf_file in edf_files:
-                file_windows, file_labels = self._load_edf(edf_file, seizure_info.get(edf_file.name, []))
+                file_windows, file_labels = self._load_edf(
+                    edf_file,
+                    seizure_info.get(edf_file.name, [])
+                )
                 windows.extend(file_windows)
                 labels.extend(file_labels)
-        
-        print(f"Total windows: {len(windows)}, Seizure: {sum(labels)}, Non-seizure: {len(labels)-sum(labels)}")
+
+                if self.max_windows is not None and len(windows) >= self.max_windows:
+                    print(f"Reached max_windows={self.max_windows}, stopping early.")
+                    break
+
+            if self.max_windows is not None and len(windows) >= self.max_windows:
+                break
+
+        print(
+            f"Total windows: {len(windows)}, "
+            f"Seizure: {int(np.sum(labels))}, "
+            f"Non-seizure: {len(labels) - int(np.sum(labels))}"
+        )
+
+        if len(windows) == 0:
+            return np.array([]), np.array([])
+
+        # Ensure consistent shape so we can stack
+        expected_shape = windows[0].shape
+        good_windows, good_labels = [], []
+        for w, y in zip(windows, labels):
+            if w.shape == expected_shape:
+                good_windows.append(w)
+                good_labels.append(y)
+
+        print(f"Keeping {len(good_windows)} windows after filtering shape mismatches")
+
+        return (
+            np.array(good_windows, dtype=np.float32),
+            np.array(good_labels, dtype=np.int64),
+        )
         
         #windows is a tensor (number of 4 second windows, channels (23), number of samples (1024))
         # label tells whether that window index contains seizure or not
         # windows [0][0][0] would be the first window of the first of the first sample (some number that represents the wave)
-        return np.array(windows), np.array(labels)
     
     
     def _parse_summary(self, patient_dir):
@@ -131,7 +177,9 @@ class CHBMITDataset(Dataset):
         return len(self.labels)
     
     def __getitem__(self, idx):
-        return torch.FloatTensor(self.windows[idx]), torch.LongTensor([self.labels[idx]])[0]
+        x = torch.FloatTensor(self.windows[idx])
+        y = torch.tensor(int(self.labels[idx]), dtype=torch.long)
+        return x, y
 
 
 def get_dataloaders(data_dir, batch_size=32, train_ratio=0.7, val_ratio=0.15):
@@ -139,6 +187,8 @@ def get_dataloaders(data_dir, batch_size=32, train_ratio=0.7, val_ratio=0.15):
     dataset = CHBMITDataset(data_dir)
     
     n = len(dataset)
+    if n == 0:
+        return None, None, None
     indices = np.random.permutation(n)
     train_end = int(train_ratio * n)
     val_end = int((train_ratio + val_ratio) * n)
@@ -151,9 +201,9 @@ def get_dataloaders(data_dir, batch_size=32, train_ratio=0.7, val_ratio=0.15):
     val_dataset = torch.utils.data.Subset(dataset, val_indices)
     test_dataset = torch.utils.data.Subset(dataset, test_indices)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     
     return train_loader, val_loader, test_loader
 

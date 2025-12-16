@@ -92,9 +92,7 @@ def train_epoch(model, loader, criterion, optimizer, device):
         optimizer.step()
 
         running_loss += loss.item()
-        probs = torch.softmax(logits, dim=1)
-        seizure_probs = probs[:, 1]
-        preds = (seizure_probs > 0.05).long()
+        preds = torch.argmax(logits, dim=1)
         all_preds.extend(preds.detach().cpu().numpy())
         all_labels.extend(y.detach().cpu().numpy())
 
